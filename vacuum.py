@@ -9,10 +9,9 @@ import asyncpg
 import discord
 import boto3
 import json
-import random  # <-- added
+import random
 from botocore.config import Config as BotoConfig
 from discord import Intents
-from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -116,21 +115,6 @@ ON CONFLICT (message_id) DO UPDATE SET
 """
 
 # --------------------- Helpers ----------------------
-import re
-
-def _parse_date_range(arg: str) -> tuple[dt.date, dt.date]:
-    """Parse flexible date-range arg like '2024-01-01 - 2024-02-01', '2024-01-01 to 2024-02-01', or '2024-01-01 2024-02-01'."""
-    s = (arg or "").strip()
-    # normalize separators to a single space
-    s = re.sub(r"\s*(?:to|–|—|-)\s*", " ", s, flags=re.IGNORECASE)
-    parts = s.split()
-    if len(parts) != 2:
-        raise ValueError("Provide a start and end date e.g. 2024-01-01 - 2024-01-31")
-    d0 = dt.date.fromisoformat(parts[0])
-    d1 = dt.date.fromisoformat(parts[1])
-    if d1 < d0:
-        raise ValueError("End date is before start date")
-    return d0, d1
 
 def hex_color(c: discord.Color | None):
     if not c or c.value == 0:
@@ -376,7 +360,6 @@ async def archive_range_for_channel(
             count += 1
 
             if delete_after and can_delete:
-                # was: await msg.delete() + fixed sleep
                 await safe_delete_message(msg)
 
         except Exception as e:
@@ -384,47 +367,22 @@ async def archive_range_for_channel(
             continue
     return count
 
-async def archive_yesterday_for_guild(guild: discord.Guild, delete_after: bool = False):
-    today_local = dt.datetime.now(TZ).date()
-    yday = today_local - dt.timedelta(days=1)
-    s, e = local_day_bounds(yday, TZ)
-    total = 0
-    for ch in guild.text_channels:
-        perms = ch.permissions_for(guild.me)
-        if not (perms.view_channel and perms.read_message_history):
-            continue
-        try:
-            total += await archive_range_for_channel(ch, s, e, yday, delete_after=delete_after)
-        except discord.Forbidden:
-            continue
-    return total
-
-# -------------------- Scheduler ---------------------
-@tasks.loop(hours=24)
-async def daily_archive():
-    print("[daily] running...")
-    total = 0
-    for g in client.guilds:
-        try:
-            total += await archive_yesterday_for_guild(g, delete_after=False)
-        except Exception as e:
-            print(f"error {e}")
-    print(f"[daily] archived {total} msgs")
-
 # -------------------- Commands ----------------------
 @tree.command(
     name="archive",
-    description="Archive a date range from a channel (admins only). Optionally delete after archiving."
+    description="Archive messages from a selected channel between start and end dates (admins only). Optionally delete after archiving."
 )
 @discord.app_commands.describe(
     channel="Channel to archive from",
-    date_range="YYYY-MM-DD - YYYY-MM-DD (ARCHIVE_TZ)",
+    start_date="Start date in YYYY-MM-DD (ARCHIVE_TZ)",
+    end_date="End date in YYYY-MM-DD (ARCHIVE_TZ)",
     delete_after="Delete messages after archiving"
 )
 async def archive_cmd(
     inter: discord.Interaction,
     channel: discord.TextChannel,
-    date_range: str,
+    start_date: str,
+    end_date: str,
     delete_after: bool = False,
 ):
     # Admin gate
@@ -432,16 +390,17 @@ async def archive_cmd(
         await inter.response.send_message("Admins only.", ephemeral=True)
         return
 
-    # Ensure selected channel is in this guild
     if channel.guild.id != inter.guild.id:
         await inter.response.send_message("Pick a channel from this server.", ephemeral=True)
         return
 
-    # Parse date range
     try:
-        d0, d1 = _parse_date_range(date_range)
+        d0 = dt.date.fromisoformat(start_date)
+        d1 = dt.date.fromisoformat(end_date)
+        if d1 < d0:
+            raise ValueError("End date is before start date")
     except Exception as e:
-        await inter.response.send_message(f"Invalid date range: {e}", ephemeral=True)
+        await inter.response.send_message(f"Invalid dates: {e}", ephemeral=True)
         return
 
     await inter.response.defer(ephemeral=True, thinking=True)
@@ -469,7 +428,6 @@ async def on_ready():
     log.info("gateway: on_ready as %s (id=%s)", client.user, getattr(client.user, 'id', '?'))
     await ensure_bucket_exists()
     await tree.sync()
-    daily_archive.start()
 
 @client.event
 async def on_connect():
