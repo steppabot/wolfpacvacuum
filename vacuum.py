@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sys
+import logging
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -12,6 +14,11 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# basic logging
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format='[%(asctime)s] %(levelname)s %(name)s: %(message)s')
+log = logging.getLogger("archivebot")
 
 # ----------------------- Env -----------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -404,17 +411,40 @@ async def archive_range_cmd(inter: discord.Interaction, start_date: str, end_dat
 # --------------------- Events -----------------------
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
+    log.info("gateway: on_ready as %s (id=%s)", client.user, getattr(client.user, 'id', '?'))
     await ensure_bucket_exists()
     await tree.sync()
     daily_archive.start()
 
+@client.event
+async def on_connect():
+    log.info("gateway: on_connect")
+
+@client.event
+async def on_resumed():
+    log.info("gateway: on_resumed")
+
 # ---------------------- Main ------------------------
 async def main():
+    # Sanity log (no secrets)
+    log.info("boot: starting main()")
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set")
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    log.info("boot: env ok | tz=%s | mirror=%s | stackhero_endpoint=%s | bucket=%s",
+             ARCHIVE_TZ, MIRROR_ATTACHMENTS, bool(STACKHERO_ENDPOINT), (STACKHERO_BUCKET or S3_BUCKET))
     await init_db()
-    await client.start(TOKEN)
+    log.info("boot: db ready, connecting to Discord gateway…")
+    try:
+        await client.start(TOKEN)
+    except Exception as e:
+        log.exception("client.start failed: %s", e)
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        log.exception("fatal: %s", e)
+        raise
