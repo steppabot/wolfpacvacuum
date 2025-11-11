@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 import discord
 import boto3
+import json
 from botocore.config import Config as BotoConfig
 from discord import Intents
 from discord.ext import tasks
@@ -236,10 +237,10 @@ async def archive_range_for_channel(
 
             local_dt = msg.created_at.astimezone(TZ)
             local_time_str = local_dt.strftime("%-I:%M %p") if os.name != "nt" else local_dt.strftime("%#I:%M %p")
-            # Build a small static avatar URL (PNG); older param `static=True` is invalid.
+            # Build a small static avatar URL (PNG) compatible with discord.py 2.x
             try:
                 asset = msg.author.display_avatar
-                if hasattr(asset, "is_animated") and asset.is_animated():
+                if getattr(asset, "is_animated", lambda: False)():
                     asset = asset.with_static_format("png")
                 avatar_url = str(asset.replace(size=128))
             except Exception as e:
@@ -263,13 +264,13 @@ async def archive_range_for_channel(
                     msg.content or None,
                 )
 
-                # Embeds → JSONB
+                # Embeds → JSONB (store full JSON dict)
                 if msg.embeds:
                     await conn.execute("DELETE FROM archived_embeds WHERE message_id = $1", msg.id)
                     for i, em in enumerate(msg.embeds):
                         await conn.execute(
-                            "INSERT INTO archived_embeds (message_id, embed_idx, embed) VALUES ($1,$2,$3)",
-                            msg.id, i, em.to_dict(),
+                            "INSERT INTO archived_embeds (message_id, embed_idx, embed) VALUES ($1,$2,$3::jsonb)",
+                            msg.id, i, json.dumps(em.to_dict()),
                         )
 
                 # Attachments → S3 + metadata (images only)
