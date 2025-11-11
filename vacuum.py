@@ -236,7 +236,11 @@ async def archive_range_for_channel(
 
             local_dt = msg.created_at.astimezone(TZ)
             local_time_str = local_dt.strftime("%-I:%M %p") if os.name != "nt" else local_dt.strftime("%#I:%M %p")
-            avatar_url = str(msg.author.display_avatar.replace(size=128, static=True))
+            # Build a small static avatar URL (PNG); older param `static=True` is invalid.
+asset = msg.author.display_avatar
+if hasattr(asset, "is_animated") and asset.is_animated():
+    asset = asset.with_static_format("png")
+avatar_url = str(asset.replace(size=128))
 
             async with _pool.acquire() as conn:
                 await conn.execute(
