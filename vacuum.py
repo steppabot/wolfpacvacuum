@@ -116,6 +116,22 @@ ON CONFLICT (message_id) DO UPDATE SET
 """
 
 # --------------------- Helpers ----------------------
+import re
+
+def _parse_date_range(arg: str) -> tuple[dt.date, dt.date]:
+    """Parse flexible date-range arg like '2024-01-01 - 2024-02-01', '2024-01-01 to 2024-02-01', or '2024-01-01 2024-02-01'."""
+    s = (arg or "").strip()
+    # normalize separators to a single space
+    s = re.sub(r"\s*(?:to|–|—|-)\s*", " ", s, flags=re.IGNORECASE)
+    parts = s.split()
+    if len(parts) != 2:
+        raise ValueError("Provide a start and end date e.g. 2024-01-01 - 2024-01-31")
+    d0 = dt.date.fromisoformat(parts[0])
+    d1 = dt.date.fromisoformat(parts[1])
+    if d1 < d0:
+        raise ValueError("End date is before start date")
+    return d0, d1
+
 def hex_color(c: discord.Color | None):
     if not c or c.value == 0:
         return None
@@ -396,47 +412,56 @@ async def daily_archive():
     print(f"[daily] archived {total} msgs")
 
 # -------------------- Commands ----------------------
-@tree.command(name="archive_manual", description="Archive yesterday (admins only). Optional delete.")
-@discord.app_commands.describe(delete_after="If true, delete messages after archiving")
-async def archive_manual(inter: discord.Interaction, delete_after: bool = False):
+@tree.command(
+    name="archive",
+    description="Archive a date range from a channel (admins only). Optionally delete after archiving."
+)
+@discord.app_commands.describe(
+    channel="Channel to archive from",
+    date_range="YYYY-MM-DD - YYYY-MM-DD (ARCHIVE_TZ)",
+    delete_after="Delete messages after archiving"
+)
+async def archive_cmd(
+    inter: discord.Interaction,
+    channel: discord.TextChannel,
+    date_range: str,
+    delete_after: bool = False,
+):
+    # Admin gate
     if not inter.user.guild_permissions.administrator:
         await inter.response.send_message("Admins only.", ephemeral=True)
         return
-    await inter.response.defer(ephemeral=True)
-    count = await archive_yesterday_for_guild(inter.guild, delete_after=delete_after)
-    await inter.followup.send(f"Archived {count} messages from yesterday. delete_after={delete_after}.", ephemeral=True)
 
-@tree.command(name="archive_range", description="Backfill a local date range (admins only). Optional delete.")
-@discord.app_commands.describe(start_date="YYYY-MM-DD (ARCHIVE_TZ)", end_date="YYYY-MM-DD inclusive (ARCHIVE_TZ)", delete_after="Delete after archiving")
-async def archive_range_cmd(inter: discord.Interaction, start_date: str, end_date: str, delete_after: bool = False):
-    if not inter.user.guild_permissions.administrator:
-        await inter.response.send_message("Admins only.", ephemeral=True)
+    # Ensure selected channel is in this guild
+    if channel.guild.id != inter.guild.id:
+        await inter.response.send_message("Pick a channel from this server.", ephemeral=True)
         return
+
+    # Parse date range
     try:
-        d0 = dt.date.fromisoformat(start_date)
-        d1 = dt.date.fromisoformat(end_date)
-        if d1 < d0:
-            raise ValueError("end before start")
-    except Exception:
-        await inter.response.send_message("Invalid dates. Use YYYY-MM-DD.", ephemeral=True)
+        d0, d1 = _parse_date_range(date_range)
+    except Exception as e:
+        await inter.response.send_message(f"Invalid date range: {e}", ephemeral=True)
         return
 
     await inter.response.defer(ephemeral=True, thinking=True)
+
     total = 0
     cur = d0
     while cur <= d1:
         s_utc, e_utc = local_day_bounds(cur, TZ)
-        for g in [inter.guild]:
-            for ch in g.text_channels:
-                perms = ch.permissions_for(g.me)
-                if not (perms.view_channel and perms.read_message_history):
-                    continue
-                try:
-                    total += await archive_range_for_channel(ch, s_utc, e_utc, cur, delete_after=delete_after)
-                except discord.Forbidden:
-                    continue
+        perms = channel.permissions_for(inter.guild.me)
+        if perms.view_channel and perms.read_message_history:
+            try:
+                total += await archive_range_for_channel(channel, s_utc, e_utc, cur, delete_after=delete_after)
+            except discord.Forbidden:
+                pass
         cur += dt.timedelta(days=1)
-    await inter.followup.send(f"Backfill complete: archived {total} messages from {d0} to {d1}. delete_after={delete_after}.", ephemeral=True)
+
+    await inter.followup.send(
+        f"Archived {total} messages from {channel.mention} between {d0} and {d1}. delete_after={delete_after}.",
+        ephemeral=True,
+    )
 
 # --------------------- Events -----------------------
 @client.event
