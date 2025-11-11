@@ -370,7 +370,7 @@ async def archive_range_for_channel(
 # -------------------- Commands ----------------------
 @tree.command(
     name="archive",
-    description="Archive messages from a selected channel between start and end dates (admins only). Optionally delete after archiving."
+    description="Vacuum all Messages in Channel."
 )
 @discord.app_commands.describe(
     channel="Channel to archive from",
