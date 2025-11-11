@@ -9,6 +9,7 @@ import asyncpg
 import discord
 import boto3
 import json
+import random  # <-- added
 from botocore.config import Config as BotoConfig
 from discord import Intents
 from discord.ext import tasks
@@ -115,7 +116,6 @@ ON CONFLICT (message_id) DO UPDATE SET
 """
 
 # --------------------- Helpers ----------------------
-
 def hex_color(c: discord.Color | None):
     if not c or c.value == 0:
         return None
@@ -146,8 +146,33 @@ async def init_db():
     async with _pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
 
-# ------------------ Object Storage ------------------
+# ---------- rate-limit–aware delete ----------
+async def safe_delete_message(msg) -> bool:
+    """Delete a message with exponential backoff and jitter on 429."""
+    for attempt in range(5):
+        try:
+            await msg.delete()
+            await asyncio.sleep(0.35 + random.random() * 0.25)  # light pacing between deletes
+            return True
+        except discord.HTTPException as e:
+            if getattr(e, "status", None) == 429:
+                delay = min(6.0, (2 ** attempt) * 0.6 + random.random())
+                print(f"[rate-limit] DELETE retry in {delay:.2f}s for msg {msg.id}")
+                await asyncio.sleep(delay)
+                continue
+            elif isinstance(e, discord.Forbidden):
+                print(f"[delete] forbidden on msg {msg.id}")
+                return False
+            else:
+                print(f"[delete] http error on msg {msg.id}: {e}")
+                await asyncio.sleep(0.6)
+        except discord.Forbidden:
+            print(f"[delete] forbidden on msg {msg.id}")
+            return False
+    print(f"[delete] gave up on msg {msg.id}")
+    return False
 
+# ------------------ Object Storage ------------------
 def _s3_client():
     # Prefer Stackhero/MinIO
     if STACKHERO_ENDPOINT and STACKHERO_ACCESS_KEY and STACKHERO_SECRET_KEY and (STACKHERO_BUCKET or S3_BUCKET):
@@ -237,7 +262,7 @@ async def archive_range_for_channel(
 
             local_dt = msg.created_at.astimezone(TZ)
             local_time_str = local_dt.strftime("%-I:%M %p") if os.name != "nt" else local_dt.strftime("%#I:%M %p")
-            # Build a small static avatar URL (PNG) compatible with discord.py 2.x
+            # Build a small static avatar URL (discord.py 2.x safe)
             try:
                 asset = msg.author.display_avatar
                 if getattr(asset, "is_animated", lambda: False)():
@@ -264,7 +289,7 @@ async def archive_range_for_channel(
                     msg.content or None,
                 )
 
-                # Embeds → JSONB (store full JSON dict)
+                # Embeds → JSONB
                 if msg.embeds:
                     await conn.execute("DELETE FROM archived_embeds WHERE message_id = $1", msg.id)
                     for i, em in enumerate(msg.embeds):
@@ -335,13 +360,9 @@ async def archive_range_for_channel(
             count += 1
 
             if delete_after and can_delete:
-                try:
-                    await msg.delete()
-                    await asyncio.sleep(0.2)
-                except discord.Forbidden:
-                    pass
-                except discord.HTTPException:
-                    pass
+                # was: await msg.delete() + fixed sleep
+                await safe_delete_message(msg)
+
         except Exception as e:
             print(f"[archive][{channel.id}] msg {msg.id} error: {e}")
             continue
