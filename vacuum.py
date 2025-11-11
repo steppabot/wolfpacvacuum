@@ -4,6 +4,7 @@ import sys
 import logging
 import datetime as dt
 from zoneinfo import ZoneInfo
+from typing import Optional, Callable, Awaitable
 
 import asyncpg
 import discord
@@ -115,7 +116,6 @@ ON CONFLICT (message_id) DO UPDATE SET
 """
 
 # --------------------- Helpers ----------------------
-
 def hex_color(c: discord.Color | None):
     if not c or c.value == 0:
         return None
@@ -237,6 +237,7 @@ async def archive_range_for_channel(
     end_utc: dt.datetime,
     date_local: dt.date,
     delete_after: bool = False,
+    progress_cb: Optional[Callable[[int], Awaitable[None]]] = None,   # <--- added
 ) -> int:
     if _pool is None:
         raise RuntimeError("DB not ready")
@@ -359,6 +360,13 @@ async def archive_range_for_channel(
 
             count += 1
 
+            # progress every 1,000
+            if progress_cb and (count % 1000 == 0):
+                try:
+                    await progress_cb(count)
+                except Exception:
+                    pass
+
             if delete_after and can_delete:
                 await safe_delete_message(msg)
 
@@ -405,6 +413,24 @@ async def archive_cmd(
 
     await inter.response.defer(ephemeral=True, thinking=True)
 
+    # fun messages for progress pings
+    hype_lines = [
+        "🔥 **EUPHORIA SURGE** — another **{n:,}** messages secured!",
+        "🚀 Archives blasting off — **{n:,}** captured!",
+        "💾 Vault expanding — **{n:,}** logged and safe.",
+        "🌈 Euphoric energy — **{n:,}** messages preserved!",
+        "🏆 Collector streak — **{n:,}** in the vault!",
+    ]
+    progress_total = 0
+
+    async def progress_cb(n_local: int):
+        # n_local is per-call count; add to running total for this channel/day sweep
+        # We'll just compute total from outer variable to keep it simple.
+        await inter.followup.send(
+            random.choice(hype_lines).format(n=progress_total),
+            ephemeral=True
+        )
+
     total = 0
     cur = d0
     while cur <= d1:
@@ -412,13 +438,28 @@ async def archive_cmd(
         perms = channel.permissions_for(inter.guild.me)
         if perms.view_channel and perms.read_message_history:
             try:
-                total += await archive_range_for_channel(channel, s_utc, e_utc, cur, delete_after=delete_after)
+                before = total
+                # wrap a per-day wrapper to bump the outer total so progress shows global count
+                async def day_progress_cb(_):
+                    nonlocal progress_total
+                    progress_total = total
+                    await progress_cb(progress_total)
+                added = await archive_range_for_channel(
+                    channel, s_utc, e_utc, cur,
+                    delete_after=delete_after,
+                    progress_cb=day_progress_cb
+                )
+                total += added
+                progress_total = total  # keep in sync
+                log.info("[archive][%s][#%s] %s archived=%d (running total=%d)",
+                         channel.guild.id, channel.name, cur.isoformat(), added, total)
             except discord.Forbidden:
                 pass
         cur += dt.timedelta(days=1)
 
     await inter.followup.send(
-        f"Archived {total} messages from {channel.mention} between {d0} and {d1}. delete_after={delete_after}.",
+        f"✅ Finished: archived **{total:,}** messages from {channel.mention} between **{d0}** and **{d1}**. "
+        f"delete_after={delete_after}.",
         ephemeral=True,
     )
 
