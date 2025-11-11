@@ -13,34 +13,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ----------------------- Env -----------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 ARCHIVE_TZ = os.getenv("ARCHIVE_TZ", "America/Chicago")
-MIRROR_ATTACHMENTS = os.getenv("MIRROR_ATTACHMENTS", "true").lower() in {"1","true","yes","on"}
-MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(12 * 1024 * 1024)))  # 12 MB default
+TZ = ZoneInfo(ARCHIVE_TZ)
 
-# Object storage configuration (Stackhero MinIO by default; S3-compatible)
-# If STACKHERO_* vars are present, we use them. Otherwise, fallback to AWS-style vars.
-# Prefer Stackhero's default env names if present
+MIRROR_ATTACHMENTS = os.getenv("MIRROR_ATTACHMENTS", "true").lower() in {"1", "true", "yes", "on"}
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", str(12 * 1024 * 1024)))  # 12 MB
+S3_PREFIX = os.getenv("S3_PREFIX", "discord-archive/").strip()
+S3_PUBLIC_URL_BASE = os.getenv("S3_PUBLIC_URL_BASE", "").rstrip("/")  # optional CDN base
+
+# Prefer Stackhero MinIO vars; fallback to AWS if you ever switch
 STACKHERO_ENDPOINT = os.getenv("STACKHERO_S3_ENDPOINT") or os.getenv("STACKHERO_MINIO_HOST")
 STACKHERO_ACCESS_KEY = os.getenv("STACKHERO_S3_ACCESS_KEY") or os.getenv("STACKHERO_MINIO_ROOT_ACCESS_KEY")
 STACKHERO_SECRET_KEY = os.getenv("STACKHERO_S3_SECRET_KEY") or os.getenv("STACKHERO_MINIO_ROOT_SECRET_KEY")
-STACKHERO_BUCKET     = os.getenv("STACKHERO_S3_BUCKET") or os.getenv("STACKHERO_MINIO_BUCKET")  # you can set this
+STACKHERO_BUCKET     = os.getenv("STACKHERO_S3_BUCKET") or os.getenv("STACKHERO_MINIO_BUCKET")
 if STACKHERO_ENDPOINT and not STACKHERO_ENDPOINT.startswith("http"):
     STACKHERO_ENDPOINT = f"https://{STACKHERO_ENDPOINT}"
 
-# Optional public base (e.g., your MinIO gateway/NGINX/CDN): https://cdn.example.com
-S3_PUBLIC_URL_BASE = os.getenv("S3_PUBLIC_URL_BASE", "").rstrip("/")
-
-# Fallback AWS (if you ever decide to switch back)
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = os.getenv("S3_PREFIX", "discord-archive/").strip()
 
-TZ = ZoneInfo(ARCHIVE_TZ)
-
+# ---------------------- Discord ---------------------
 intents = Intents.default()
 intents.message_content = True
 intents.members = True
@@ -50,6 +47,7 @@ client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 _pool: asyncpg.Pool | None = None
 
+# ----------------------- SQL ------------------------
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS archived_messages (
     message_id      BIGINT PRIMARY KEY,
@@ -66,7 +64,6 @@ CREATE TABLE IF NOT EXISTS archived_messages (
     content         TEXT   NULL
 );
 
--- Attachments captured per message
 CREATE TABLE IF NOT EXISTS archived_attachments (
     message_id      BIGINT NOT NULL REFERENCES archived_messages(message_id) ON DELETE CASCADE,
     attachment_id   BIGINT NOT NULL,
@@ -82,7 +79,6 @@ CREATE TABLE IF NOT EXISTS archived_attachments (
     PRIMARY KEY (message_id, attachment_id)
 );
 
--- Embeds captured as JSON for later rendering on your site
 CREATE TABLE IF NOT EXISTS archived_embeds (
     message_id  BIGINT NOT NULL REFERENCES archived_messages(message_id) ON DELETE CASCADE,
     embed_idx   INT    NOT NULL,
@@ -110,6 +106,8 @@ ON CONFLICT (message_id) DO UPDATE SET
     content      = EXCLUDED.content;
 """
 
+# --------------------- Helpers ----------------------
+
 def hex_color(c: discord.Color | None):
     if not c or c.value == 0:
         return None
@@ -133,24 +131,26 @@ def local_day_bounds(date_local: dt.date, tz: ZoneInfo):
     return start_local.astimezone(dt.timezone.utc), end_local.astimezone(dt.timezone.utc)
 
 async def init_db():
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL is not set")
     global _pool
     _pool = await asyncpg.create_pool(DB_URL)
     async with _pool.acquire() as conn:
         await conn.execute(CREATE_SQL)
 
-# --------------------- S3 helper ---------------------
+# ------------------ Object Storage ------------------
 
 def _s3_client():
-    # Prefer Stackhero/MinIO if configured
+    # Prefer Stackhero/MinIO
     if STACKHERO_ENDPOINT and STACKHERO_ACCESS_KEY and STACKHERO_SECRET_KEY and (STACKHERO_BUCKET or S3_BUCKET):
         return boto3.client(
             "s3",
             endpoint_url=STACKHERO_ENDPOINT,
             aws_access_key_id=STACKHERO_ACCESS_KEY,
             aws_secret_access_key=STACKHERO_SECRET_KEY,
-            config=BotoConfig(s3={"addressing_style": "path"}),  # path-style is safest for MinIO
+            config=BotoConfig(s3={"addressing_style": "path"}),
         )
-    # Else fall back to AWS S3
+    # Fallback AWS S3
     if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET:
         return boto3.client(
             "s3",
@@ -159,7 +159,7 @@ def _s3_client():
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
             config=BotoConfig(s3={"addressing_style": "virtual"}),
         )
-    raise RuntimeError("Object storage not configured: set STACKHERO_* (MINIO) or AWS_* env vars")
+    raise RuntimeError("Object storage not configured: set STACKHERO_* or AWS_* env vars")
 
 def _safe_key_component(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)[:180]
@@ -180,74 +180,24 @@ async def ensure_bucket_exists():
     try:
         s3 = _s3_client()
         b = _bucket_name()
-        # MinIO create_bucket is idempotent but may throw if exists; handle gracefully
         try:
             s3.create_bucket(Bucket=b)
         except Exception as e:
-            # If it's a BucketAlreadyOwnedByYou / BucketAlreadyExists, ignore
-            msg = str(e).lower()
-            if "already" not in msg and "exist" not in msg:
+            m = str(e).lower()
+            if "exist" not in m and "already" not in m:
                 raise
     except Exception as e:
         print(f"[s3] ensure_bucket_exists failed: {e}")
 
-# --------------------- S3 helper ---------------------
-
-def _s3_client():
-    # Prefer Stackhero/MinIO if configured
-    if STACKHERO_ENDPOINT and STACKHERO_ACCESS_KEY and STACKHERO_SECRET_KEY and (STACKHERO_BUCKET or S3_BUCKET):
-        return boto3.client(
-            "s3",
-            endpoint_url=STACKHERO_ENDPOINT,
-            aws_access_key_id=STACKHERO_ACCESS_KEY,
-            aws_secret_access_key=STACKHERO_SECRET_KEY,
-            config=BotoConfig(s3={"addressing_style": "path"}),  # path-style is safest for MinIO
-        )
-    # Else fall back to AWS S3
-    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_BUCKET:
-        return boto3.client(
-            "s3",
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            config=BotoConfig(s3={"addressing_style": "virtual"}),
-        )
-    raise RuntimeError("Object storage not configured: set STACKHERO_* (MINIO) or AWS_* env vars"):
-        raise RuntimeError("S3 not configured: set AWS_ACCESS_KEY_ID/SECRET, S3_BUCKET")
-    return boto3.client(
-        "s3",
-        region_name=AWS_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        config=BotoConfig(s3={"addressing_style": "virtual"}),
-    )
-
-def _safe_key_component(s: str) -> str:
-    return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)[:180]
-
-def _build_s3_key(guild_id: int, channel_id: int, date_local: dt.date, message_id: int, attachment_id: int, filename: str) -> str:
-    fname = _safe_key_component(filename)
-    return f"{S3_PREFIX}{guild_id}/{channel_id}/{date_local.isoformat()}/{message_id}/{attachment_id}_{fname}"
-
-def _public_url_for_key(key: str) -> str | None:
-    if not S3_PUBLIC_URL_BASE:
-        return None
-    return f"{S3_PUBLIC_URL_BASE}/{key}"
-
-# ----------------- Attachment allowlist -----------------
-
-_ALLOWED_EXTS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
-}
-
+# --------------- Attachment allowlist ---------------
+_ALLOWED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 
 def _is_allowed_attachment(filename: str, content_type: str | None) -> bool:
-    # Images only
     if content_type:
         return content_type.startswith("image/")
-    ext = os.path.splitext(filename)[1].lower()
-    return ext in _ALLOWED_EXTS
+    return os.path.splitext(filename)[1].lower() in _ALLOWED_EXTS
 
+# -------------------- Archiving ---------------------
 async def archive_range_for_channel(
     channel: discord.TextChannel,
     start_utc: dt.datetime,
@@ -255,7 +205,6 @@ async def archive_range_for_channel(
     date_local: dt.date,
     delete_after: bool = False,
 ) -> int:
-    """Archive messages in (start_utc, end_utc] for a channel; optionally delete after. Returns count."""
     if _pool is None:
         raise RuntimeError("DB not ready")
     count = 0
@@ -299,9 +248,8 @@ async def archive_range_for_channel(
                     msg.content or None,
                 )
 
-                # Store embeds as JSONB
+                # Embeds → JSONB
                 if msg.embeds:
-                    # purge any existing embeds first in case of re-run
                     await conn.execute("DELETE FROM archived_embeds WHERE message_id = $1", msg.id)
                     for i, em in enumerate(msg.embeds):
                         await conn.execute(
@@ -309,15 +257,14 @@ async def archive_range_for_channel(
                             msg.id, i, em.to_dict(),
                         )
 
-                # Store attachments (metadata + S3 upload)
-                if msg.attachments and MIRROR_ATTACHMENTS:
-                    s3 = _s3_client()
+                # Attachments → S3 + metadata (images only)
                 if msg.attachments:
+                    s3 = _s3_client() if MIRROR_ATTACHMENTS else None
                     for a in msg.attachments:
                         filename = a.filename
                         content_type = getattr(a, 'content_type', None)
                         if not _is_allowed_attachment(filename, content_type):
-                            continue  # only archive images/videos
+                            continue
                         size = a.size or 0
                         url = a.url
                         proxy_url = a.proxy_url
@@ -326,13 +273,12 @@ async def archive_range_for_channel(
                         s3_url = None
                         sha256_hex = None
 
-                        if MIRROR_ATTACHMENTS and size <= MAX_ATTACHMENT_BYTES:
+                        if MIRROR_ATTACHMENTS and size <= MAX_ATTACHMENT_BYTES and s3 is not None:
                             try:
                                 data = await a.read()
                                 import hashlib
                                 sha256_hex = hashlib.sha256(data).hexdigest()
-
-                                # Simple dedupe: if we already have this sha256 uploaded, reuse its key/url
+                                # Dedupe: reuse existing upload by hash
                                 rec = await conn.fetchrow(
                                     "SELECT s3_key, s3_url FROM archived_attachments WHERE sha256_hex = $1 AND s3_key IS NOT NULL LIMIT 1",
                                     sha256_hex,
@@ -348,44 +294,6 @@ async def archive_range_for_channel(
                                     else:
                                         s3.put_object(Bucket=(STACKHERO_BUCKET or S3_BUCKET), Key=s3_key, Body=data)
                                     s3_url = _public_url_for_key(s3_key)
-                            except Exception as e:
-                                print(f"[attach] upload failed {a.id}: {e}")
-                            except Exception as e:
-                                print(f"[attach] upload failed {a.id}: {e}")
-
-                        await conn.execute(
-                            """
-                            INSERT INTO archived_attachments (
-                                message_id, attachment_id, filename, content_type, size_bytes,
-                                url, proxy_url, sha256_hex, s3_key, s3_url
-                            )
-                            """,
-                            msg.id, int(a.id), filename, content_type, size, url, proxy_url, sha256_hex, s3_key, s3_url,
-                        )
-                if msg.attachments:
-                    for a in msg.attachments:
-                        filename = a.filename
-                        content_type = getattr(a, 'content_type', None)
-                        size = a.size or 0
-                        url = a.url
-                        proxy_url = a.proxy_url
-
-                        s3_key = None
-                        s3_url = None
-                        sha256_hex = None
-
-                        if MIRROR_ATTACHMENTS and size <= MAX_ATTACHMENT_BYTES:
-                            try:
-                                data = await a.read()
-                                import hashlib
-                                sha256_hex = hashlib.sha256(data).hexdigest()
-                                s3_key = _build_s3_key(channel.guild.id, channel.id, date_local, msg.id, int(a.id), filename)
-                                extra = {"ContentType": content_type} if content_type else None
-                                if extra:
-                                    s3.put_object(Bucket=(STACKHERO_BUCKET or S3_BUCKET), Key=s3_key, Body=data, **extra)
-                                else:
-                                    s3.put_object(Bucket=(STACKHERO_BUCKET or S3_BUCKET), Key=s3_key, Body=data)
-                                s3_url = _public_url_for_key(s3_key)
                             except Exception as e:
                                 print(f"[attach] upload failed {a.id}: {e}")
 
@@ -406,38 +314,6 @@ async def archive_range_for_channel(
                                 s3_url = COALESCE(EXCLUDED.s3_url, archived_attachments.s3_url)
                             """,
                             msg.id, int(a.id), filename, content_type, size, url, proxy_url, sha256_hex, s3_key, s3_url,
-                        )
-                        size = a.size or 0
-                        url = a.url
-                        proxy_url = a.proxy_url
-
-                        file_bytes = None
-                        sha256_hex = None
-                        if MIRROR_ATTACHMENTS and size <= MAX_ATTACHMENT_BYTES:
-                            try:
-                                data = await a.read()  # bytes
-                                import hashlib
-                                sha256_hex = hashlib.sha256(data).hexdigest()
-                                file_bytes = data
-                            except Exception as e:
-                                print(f"[attach] read failed {a.id}: {e}")
-
-                        await conn.execute(
-                            """
-                            INSERT INTO archived_attachments (
-                                message_id, attachment_id, filename, content_type, size_bytes,
-                                url, proxy_url, sha256_hex, bytes
-                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                            ON CONFLICT (message_id, attachment_id) DO UPDATE SET
-                                filename = EXCLUDED.filename,
-                                content_type = EXCLUDED.content_type,
-                                size_bytes = EXCLUDED.size_bytes,
-                                url = EXCLUDED.url,
-                                proxy_url = EXCLUDED.proxy_url,
-                                sha256_hex = COALESCE(EXCLUDED.sha256_hex, archived_attachments.sha256_hex),
-                                bytes = COALESCE(EXCLUDED.bytes, archived_attachments.bytes)
-                            """,
-                            msg.id, int(a.id), filename, content_type, size, url, proxy_url, sha256_hex, file_bytes,
                         )
 
             count += 1
@@ -470,19 +346,19 @@ async def archive_yesterday_for_guild(guild: discord.Guild, delete_after: bool =
             continue
     return total
 
+# -------------------- Scheduler ---------------------
 @tasks.loop(hours=24)
 async def daily_archive():
     print("[daily] running...")
     total = 0
     for g in client.guilds:
         try:
-            total += await archive_yesterday_for_guild(g, delete_after=False)  # daily keeps history unless you set True
+            total += await archive_yesterday_for_guild(g, delete_after=False)
         except Exception as e:
             print(f"error {e}")
     print(f"[daily] archived {total} msgs")
 
-# -------------------------- Slash Commands --------------------------
-
+# -------------------- Commands ----------------------
 @tree.command(name="archive_manual", description="Archive yesterday (admins only). Optional delete.")
 @discord.app_commands.describe(delete_after="If true, delete messages after archiving")
 async def archive_manual(inter: discord.Interaction, delete_after: bool = False):
@@ -525,7 +401,7 @@ async def archive_range_cmd(inter: discord.Interaction, start_date: str, end_dat
         cur += dt.timedelta(days=1)
     await inter.followup.send(f"Backfill complete: archived {total} messages from {d0} to {d1}. delete_after={delete_after}.", ephemeral=True)
 
-@client.event
+# --------------------- Events -----------------------
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
@@ -533,7 +409,10 @@ async def on_ready():
     await tree.sync()
     daily_archive.start()
 
+# ---------------------- Main ------------------------
 async def main():
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set")
     await init_db()
     await client.start(TOKEN)
 
