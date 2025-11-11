@@ -237,10 +237,14 @@ async def archive_range_for_channel(
             local_dt = msg.created_at.astimezone(TZ)
             local_time_str = local_dt.strftime("%-I:%M %p") if os.name != "nt" else local_dt.strftime("%#I:%M %p")
             # Build a small static avatar URL (PNG); older param `static=True` is invalid.
-asset = msg.author.display_avatar
-if hasattr(asset, "is_animated") and asset.is_animated():
-    asset = asset.with_static_format("png")
-avatar_url = str(asset.replace(size=128))
+            try:
+                asset = msg.author.display_avatar
+                if hasattr(asset, "is_animated") and asset.is_animated():
+                    asset = asset.with_static_format("png")
+                avatar_url = str(asset.replace(size=128))
+            except Exception as e:
+                print(f"[archive][{channel.id}] msg {msg.id} avatar error: {e}")
+                avatar_url = None
 
             async with _pool.acquire() as conn:
                 await conn.execute(
