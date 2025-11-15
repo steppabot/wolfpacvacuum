@@ -431,39 +431,35 @@ async def archive_cmd(
                     s_utc,
                     e_utc,
                     cur,
-                    delete_after=False,   # <- we now delete via purge, not per-message
+                    delete_after=False,   # delete via purge, not per-message
                     progress_cb=None,
                 )
                 total += added
-                log.info(
-                    "[archive][%s][#%s] %s archived=%d (running total=%d)",
-                    channel.guild.id,
-                    channel.name,
-                    cur.isoformat(),
-                    added,
-                    total,
-                )
+
+                # Only log noisy days if something actually got archived
+                if added > 0:
+                    log.info(
+                        "[archive][%s][#%s] %s archived=%d (running total=%d)",
+                        channel.guild.id,
+                        channel.name,
+                        cur.isoformat(),
+                        added,
+                        total,
+                    )
 
                 # 2) PURGE this day if requested
                 if delete_after and perms.manage_messages and added > 0:
                     def _purge_check(m: discord.Message) -> bool:
-                        # Match the same filters you use when archiving
-
                         # Skip pinned messages
                         if m.pinned:
                             return False
-
                         # Skip bot messages
                         if m.author.bot:
                             return False
-
-                        # Skip anything with a ⭐ reaction (your "keep" flag)
+                        # Skip anything with a ⭐ reaction
                         for r in m.reactions:
-                            # r.emoji can be unicode or a custom emoji; we only care about the unicode star
                             if str(r.emoji) == "⭐" and r.count > 0:
                                 return False
-
-                        # Everything else can be purged
                         return True
 
                     try:
@@ -471,7 +467,8 @@ async def archive_cmd(
                             after=s_utc,
                             before=e_utc,
                             check=_purge_check,
-                            bulk=True,           # use bulk delete; daily → well under 14 days
+                            limit=None,   # <-- delete all matching msgs in that day
+                            bulk=True,
                         )
                         log.info(
                             "[purge][%s][#%s] %s deleted=%d",
