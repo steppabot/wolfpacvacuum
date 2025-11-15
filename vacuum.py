@@ -413,7 +413,7 @@ async def archive_cmd(
         await inter.response.send_message(f"Invalid dates: {e}", ephemeral=True)
         return
 
-    # Silently ACK – ephemeral, no content, just the little "thinking" for you
+    # Silently ACK – ephemeral spinner for you only
     await inter.response.defer(ephemeral=True, thinking=True)
 
     total = 0
@@ -425,13 +425,14 @@ async def archive_cmd(
 
         if perms.view_channel and perms.read_message_history:
             try:
+                # 1) ARCHIVE this day
                 added = await archive_range_for_channel(
                     channel,
                     s_utc,
                     e_utc,
                     cur,
-                    delete_after=delete_after,
-                    progress_cb=None,  # no mid-run followups
+                    delete_after=False,   # <- we now delete via purge, not per-message
+                    progress_cb=None,
                 )
                 total += added
                 log.info(
@@ -442,13 +443,64 @@ async def archive_cmd(
                     added,
                     total,
                 )
+
+                # 2) PURGE this day if requested
+                if delete_after and perms.manage_messages and added > 0:
+                    def _purge_check(m: discord.Message) -> bool:
+                        # Match the same filters you use when archiving
+
+                        # Skip pinned messages
+                        if m.pinned:
+                            return False
+
+                        # Skip bot messages
+                        if m.author.bot:
+                            return False
+
+                        # Skip anything with a ⭐ reaction (your "keep" flag)
+                        for r in m.reactions:
+                            # r.emoji can be unicode or a custom emoji; we only care about the unicode star
+                            if str(r.emoji) == "⭐" and r.count > 0:
+                                return False
+
+                        # Everything else can be purged
+                        return True
+
+                    try:
+                        deleted = await channel.purge(
+                            after=s_utc,
+                            before=e_utc,
+                            check=_purge_check,
+                            bulk=True,           # use bulk delete; daily → well under 14 days
+                        )
+                        log.info(
+                            "[purge][%s][#%s] %s deleted=%d",
+                            channel.guild.id,
+                            channel.name,
+                            cur.isoformat(),
+                            len(deleted),
+                        )
+                    except discord.Forbidden:
+                        log.warning(
+                            "[purge][%s][#%s] missing manage_messages",
+                            channel.guild.id,
+                            channel.name,
+                        )
+                    except discord.HTTPException as e:
+                        log.error(
+                            "[purge][%s][#%s] failed: %s",
+                            channel.guild.id,
+                            channel.name,
+                            e,
+                        )
+
             except discord.Forbidden:
-                # no perms for this day
+                # no perms for this day at all
                 pass
 
         cur += dt.timedelta(days=1)
 
-    # Final summary we WANT to show as ephemeral in that channel, only to you
+    # Final summary we WANT as ephemeral in that channel, just to you
     summary = (
         f"✅ Finished: archived **{total:,}** messages from {channel.mention} "
         f"between **{d0}** and **{d1}**.\n"
@@ -456,13 +508,13 @@ async def archive_cmd(
     )
 
     try:
-        # This is the ephemeral-in-channel send you want
         await inter.followup.send(summary, ephemeral=True)
     except discord.HTTPException as e:
-        # If we get 401 Invalid Webhook Token or any other HTTP error,
-        # just log it and DON'T crash, DON'T DM, DON'T send publicly.
-        log.warning("archive: final ephemeral followup failed (%s); archive itself completed.", e)
-        # nothing else – completely silent to everyone except logs
+        # Token might be dead if it took too long – archive is still done, just no final ping
+        log.warning(
+            "archive: final ephemeral followup failed (likely token expired) – archive completed. %s",
+            e,
+        )
 
 # --------------------- Events -----------------------
 @client.event
