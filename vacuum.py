@@ -376,6 +376,7 @@ async def archive_range_for_channel(
     return count
 
 # -------------------- Commands ----------------------
+
 @tree.command(
     name="archive",
     description="Vacuum all Messages in Channel."
@@ -402,6 +403,7 @@ async def archive_cmd(
         await inter.response.send_message("Pick a channel from this server.", ephemeral=True)
         return
 
+    # Parse dates
     try:
         d0 = dt.date.fromisoformat(start_date)
         d1 = dt.date.fromisoformat(end_date)
@@ -411,56 +413,40 @@ async def archive_cmd(
         await inter.response.send_message(f"Invalid dates: {e}", ephemeral=True)
         return
 
+    # Defer once
     await inter.response.defer(ephemeral=True, thinking=True)
-
-    # fun messages for progress pings
-    hype_lines = [
-        "🔥 **EUPHORIA SURGE** — another **{n:,}** messages secured!",
-        "🚀 Archives blasting off — **{n:,}** captured!",
-        "💾 Vault expanding — **{n:,}** logged and safe.",
-        "🌈 Euphoric energy — **{n:,}** messages preserved!",
-        "🏆 Collector streak — **{n:,}** in the vault!",
-    ]
-    progress_total = 0
-
-    async def progress_cb(n_local: int):
-        # n_local is per-call count; add to running total for this channel/day sweep
-        # We'll just compute total from outer variable to keep it simple.
-        await inter.followup.send(
-            random.choice(hype_lines).format(n=progress_total),
-            ephemeral=True
-        )
 
     total = 0
     cur = d0
+
     while cur <= d1:
         s_utc, e_utc = local_day_bounds(cur, TZ)
         perms = channel.permissions_for(inter.guild.me)
+
         if perms.view_channel and perms.read_message_history:
             try:
-                before = total
-                # wrap a per-day wrapper to bump the outer total so progress shows global count
-                async def day_progress_cb(_):
-                    nonlocal progress_total
-                    progress_total = total
-                    await progress_cb(progress_total)
                 added = await archive_range_for_channel(
-                    channel, s_utc, e_utc, cur,
+                    channel,
+                    s_utc,
+                    e_utc,
+                    cur,
                     delete_after=delete_after,
-                    progress_cb=day_progress_cb
+                    progress_cb=None  # <--- disable all followups
                 )
                 total += added
-                progress_total = total  # keep in sync
                 log.info("[archive][%s][#%s] %s archived=%d (running total=%d)",
                          channel.guild.id, channel.name, cur.isoformat(), added, total)
             except discord.Forbidden:
                 pass
+
         cur += dt.timedelta(days=1)
 
+    # ONE final ephemeral message
     await inter.followup.send(
-        f"✅ Finished: archived **{total:,}** messages from {channel.mention} between **{d0}** and **{d1}**. "
+        f"✅ Finished: archived **{total:,}** messages from {channel.mention} "
+        f"between **{d0}** and **{d1}**.\n"
         f"delete_after={delete_after}.",
-        ephemeral=True,
+        ephemeral=True
     )
 
 # --------------------- Events -----------------------
