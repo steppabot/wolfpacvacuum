@@ -413,7 +413,7 @@ async def archive_cmd(
         await inter.response.send_message(f"Invalid dates: {e}", ephemeral=True)
         return
 
-    # Defer once
+    # Silently ACK – ephemeral, no content, just the little "thinking" for you
     await inter.response.defer(ephemeral=True, thinking=True)
 
     total = 0
@@ -431,23 +431,38 @@ async def archive_cmd(
                     e_utc,
                     cur,
                     delete_after=delete_after,
-                    progress_cb=None  # <--- disable all followups
+                    progress_cb=None,  # no mid-run followups
                 )
                 total += added
-                log.info("[archive][%s][#%s] %s archived=%d (running total=%d)",
-                         channel.guild.id, channel.name, cur.isoformat(), added, total)
+                log.info(
+                    "[archive][%s][#%s] %s archived=%d (running total=%d)",
+                    channel.guild.id,
+                    channel.name,
+                    cur.isoformat(),
+                    added,
+                    total,
+                )
             except discord.Forbidden:
+                # no perms for this day
                 pass
 
         cur += dt.timedelta(days=1)
 
-    # ONE final ephemeral message
-    await inter.followup.send(
+    # Final summary we WANT to show as ephemeral in that channel, only to you
+    summary = (
         f"✅ Finished: archived **{total:,}** messages from {channel.mention} "
         f"between **{d0}** and **{d1}**.\n"
-        f"delete_after={delete_after}.",
-        ephemeral=True
+        f"delete_after={delete_after}."
     )
+
+    try:
+        # This is the ephemeral-in-channel send you want
+        await inter.followup.send(summary, ephemeral=True)
+    except discord.HTTPException as e:
+        # If we get 401 Invalid Webhook Token or any other HTTP error,
+        # just log it and DON'T crash, DON'T DM, DON'T send publicly.
+        log.warning("archive: final ephemeral followup failed (%s); archive itself completed.", e)
+        # nothing else – completely silent to everyone except logs
 
 # --------------------- Events -----------------------
 @client.event
