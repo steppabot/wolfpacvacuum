@@ -538,6 +538,8 @@ async def main():
         raise RuntimeError("DATABASE_URL is not set")
     log.info("boot: env ok | tz=%s | mirror=%s | stackhero_endpoint=%s | bucket=%s",
              ARCHIVE_TZ, MIRROR_ATTACHMENTS, bool(STACKHERO_ENDPOINT), (STACKHERO_BUCKET or S3_BUCKET))
+    from arcade_relay import install_relay
+    install_relay(client)
     await init_db()
     log.info("boot: db ready, connecting to Discord gateway…")
     try:
