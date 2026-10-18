@@ -46,6 +46,8 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 S3_BUCKET = os.getenv("S3_BUCKET")
 
+OWNER_ID = 568583831985061918  # put this up near your other env/config lines
+
 # ---------------------- Discord ---------------------
 intents = Intents.default()
 intents.message_content = True
@@ -381,6 +383,8 @@ async def archive_range_for_channel(
     name="archive",
     description="Vacuum all Messages in Channel."
 )
+@discord.app_commands.default_permissions(administrator=True)
+@discord.app_commands.guild_only()
 @discord.app_commands.describe(
     channel="Channel to archive from",
     start_date="Start date in YYYY-MM-DD (ARCHIVE_TZ)",
@@ -394,11 +398,11 @@ async def archive_cmd(
     end_date: str,
     delete_after: bool = False,
 ):
-    # Admin gate
-    if not inter.user.guild_permissions.administrator:
-        await inter.response.send_message("Admins only.", ephemeral=True)
+    # Owner-only gate
+    if inter.user.id != OWNER_ID:
+        await inter.response.send_message("Not allowed.", ephemeral=True)
         return
-
+      
     if channel.guild.id != inter.guild.id:
         await inter.response.send_message("Pick a channel from this server.", ephemeral=True)
         return
