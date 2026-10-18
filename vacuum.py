@@ -53,6 +53,7 @@ intents = Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
+intents.guild_reactions = True
 
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
