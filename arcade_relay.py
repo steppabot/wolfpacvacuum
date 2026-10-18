@@ -59,7 +59,16 @@ def install_relay(client):
         client.event(combined)
 
     attach('on_message', message_event)
-    for name in ('on_raw_message_edit', 'on_raw_message_delete', 'on_raw_bulk_message_delete'):
+
+    for name in (
+        'on_raw_message_edit',
+        'on_raw_message_delete',
+        'on_raw_bulk_message_delete',
+        'on_raw_reaction_add',
+        'on_raw_reaction_remove',
+        'on_raw_reaction_clear',
+        'on_raw_reaction_clear_emoji',
+    ):
         attach(name, raw_event)
 
     async def worker():
