@@ -1,49 +1,66 @@
-"""Bounded, retrying invalidation relay. No messages are archived or deleted here."""
+"""Bounded multi-server invalidation relay. Never archives or deletes messages."""
 import asyncio
 import logging
 import os
-import time
+from collections import OrderedDict
+from functools import wraps
 import aiohttp
+import discord
 
 log = logging.getLogger('arcade-relay')
 
-
 def install_relay(client):
+    if getattr(client, 'arcade_relay_task', None):
+        return
     url = os.getenv('ARCADE_RELAY_URL', '')
     secret = os.getenv('ARCADE_RELAY_SECRET', '')
-    guild = os.getenv('ARCADE_GUILD_ID', '')
-    channels = set(filter(None, (x.strip() for x in os.getenv('ARCADE_CHANNEL_IDS', '').split(','))))
     if not url or not secret:
         log.warning('Arcade relay disabled: configure ARCADE_RELAY_URL and ARCADE_RELAY_SECRET.')
         return
-    if not url.startswith('https://') or len(secret) < 32 or not guild.isdigit() or not channels or len(channels) > 20 or not all(x.isdigit() for x in channels):
+    if not url.startswith('https://') or len(secret) < 32:
         raise RuntimeError('Invalid arcade relay configuration.')
-    pending = set()
+    pending = OrderedDict()
     wake = asyncio.Event()
 
     def changed(guild_id, channel_id):
-        channel = str(channel_id)
-        if str(guild_id) == guild and channel in channels:
-            pending.add(channel)
-            wake.set()
+        if not guild_id or not channel_id:
+            return
+        channel = client.get_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel) or channel.guild.id != int(guild_id) or channel.is_nsfw():
+            return
+        me = channel.guild.me
+        if not me:
+            return
+        perms = channel.permissions_for(me)
+        if not perms.view_channel or not perms.read_message_history:
+            return
+        key = (str(guild_id), str(channel_id))
+        pending[key] = None
+        if len(pending) > 2000:
+            pending.popitem(last=False)  # Website polling repairs dropped invalidations.
+        wake.set()
 
-    @client.event
-    async def on_message(message):
-        # Include bot messages: website sends also need to appear for everyone.
+    async def message_event(message):
         if message.guild:
             changed(message.guild.id, message.channel.id)
 
-    @client.event
-    async def on_raw_message_edit(payload):
+    async def raw_event(payload):
         changed(payload.guild_id, payload.channel_id)
 
-    @client.event
-    async def on_raw_message_delete(payload):
-        changed(payload.guild_id, payload.channel_id)
+    def attach(name, handler):
+        previous = getattr(client, name, None)
+        async def combined(*args, **kwargs):
+            try:
+                await handler(*args, **kwargs)
+            finally:
+                if previous:
+                    await previous(*args, **kwargs)
+        combined.__name__ = name
+        client.event(combined)
 
-    @client.event
-    async def on_raw_bulk_message_delete(payload):
-        changed(payload.guild_id, payload.channel_id)
+    attach('on_message', message_event)
+    for name in ('on_raw_message_edit', 'on_raw_message_delete', 'on_raw_bulk_message_delete'):
+        attach(name, raw_event)
 
     async def worker():
         delay = 1
@@ -51,13 +68,15 @@ def install_relay(client):
             while True:
                 await wake.wait()
                 await asyncio.sleep(0.25)
-                channel = next(iter(pending))
-                pending.discard(channel)
+                if not pending:
+                    wake.clear()
+                    continue
+                (guild, channel), _ = pending.popitem(last=False)
                 if not pending:
                     wake.clear()
                 try:
                     async with session.post(url, headers={'Authorization': 'Bearer ' + secret},
-                                            json={'guild_id': guild, 'channel_id': channel}, allow_redirects=False) as response:
+                        json={'guild_id': guild, 'channel_id': channel}, allow_redirects=False) as response:
                         if response.status != 200:
                             raise RuntimeError('Relay HTTP ' + str(response.status))
                     delay = 1
@@ -67,6 +86,4 @@ def install_relay(client):
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 30)
 
-    # Hold a reference to the task for the lifetime of the client.
     client.arcade_relay_task = asyncio.create_task(worker())
-    # Refresh connected websites after startup/reconnect gaps via their fallback timer.
