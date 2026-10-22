@@ -545,6 +545,8 @@ async def main():
              ARCHIVE_TZ, MIRROR_ATTACHMENTS, bool(STACKHERO_ENDPOINT), (STACKHERO_BUCKET or S3_BUCKET))
     from arcade_relay import install_relay
     install_relay(client)
+    from arcade_groups import install_groups
+    install_groups(client, tree)
     await init_db()
     log.info("boot: db ready, connecting to Discord gateway…")
     try:
