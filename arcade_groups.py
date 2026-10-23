@@ -16,6 +16,7 @@ log = logging.getLogger('arcade-groups')
 # Games that support multiplayer groups. Keys match the arcade's games.json ids.
 GAMES = {
     'goldeneye007': {'title': 'GoldenEye 007', 'emoji': '🔫', 'max': 4},
+    'wcwvsnworevenge': {'title': 'WCW vs NWO Revenge', 'emoji': '🤼', 'max': 4},
 }
 GROUP_ID = r'(?P<gid>[A-Za-z0-9_-]{8,24})'
 COLOR = 0x2ED7E9
